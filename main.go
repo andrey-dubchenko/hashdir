@@ -5,121 +5,130 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
 )
 
-func calculateHash(algorithm string, filename string) (string, error) {
-	file, err := os.Open(filename)
+const (
+	version      = "1.0.0"
+	author       = "Andrey Dubchenko"
+	authorURL    = "https://github.com/andrey-dubchenko"
+	defaultHash  = "sha256"
+	usageMessage = "Usage: hashdir [sha256/md5] <directory>"
+)
 
+// hashers maps a supported algorithm name to its constructor.
+var hashers = map[string]func() hash.Hash{
+	"md5":    md5.New,
+	"sha256": sha256.New,
+}
+
+func calculateHash(newHash func() hash.Hash, filename string) (string, error) {
+	file, err := os.Open(filename)
 	if err != nil {
 		return "", err
 	}
+	defer closeQuietly(file)
 
-	defer func(file *os.File) {
-		err := file.Close()
-		if err != nil {
-			fmt.Println("Error while closing file:", err)
-		}
-	}(file)
-
-	if algorithm == "md5" {
-		hash := md5.New()
-
-		if _, err := io.Copy(hash, file); err != nil {
-			return "", err
-		}
-
-		return hex.EncodeToString(hash.Sum(nil)), nil
+	h := newHash()
+	if _, err := io.Copy(h, file); err != nil {
+		return "", err
 	}
 
-	if algorithm == "sha256" {
-		hash := sha256.New()
-
-		if _, err := io.Copy(hash, file); err != nil {
-			return "", err
-		}
-
-		return hex.EncodeToString(hash.Sum(nil)), nil
-	}
-
-	return "", nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func walkFiles(algorithm string, root string, outputFile *os.File) error {
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+// walkFiles hashes every regular file under root and writes "path: hash" lines
+// to outputFile. skipPath is excluded so the output file never hashes itself.
+func walkFiles(newHash func() hash.Hash, root string, skipPath string, outputFile *os.File) error {
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
-		if !info.Mode().IsRegular() {
+		if !info.Mode().IsRegular() || path == skipPath {
 			return nil
 		}
 
-		hash, err := calculateHash(algorithm, path)
-
+		fileHash, err := calculateHash(newHash, path)
 		if err != nil {
 			return err
 		}
 
-		_, err = fmt.Fprintf(outputFile, "%s: %s\n", path, hash)
-
+		_, err = fmt.Fprintf(outputFile, "%s: %s\n", path, fileHash)
 		return err
 	})
+}
 
-	return err
+func closeQuietly(f *os.File) {
+	if err := f.Close(); err != nil {
+		fmt.Println("Error while closing file:", err)
+	}
+}
+
+func run(algorithm, dir string) error {
+	newHash, ok := hashers[algorithm]
+	if !ok {
+		return fmt.Errorf("bad algorithm %q, use sha256 or md5", algorithm)
+	}
+
+	outputPath, err := filepath.Abs(filepath.Join(dir, algorithm+"_hashes.txt"))
+	if err != nil {
+		return fmt.Errorf("error while resolving output path: %w", err)
+	}
+
+	outputFile, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("error while creating file with hashes: %w", err)
+	}
+	defer closeQuietly(outputFile)
+
+	fmt.Printf("Calculating hashes for directory -> %s...\n", dir)
+
+	if err := walkFiles(newHash, dir, outputPath, outputFile); err != nil {
+		return fmt.Errorf("error while trying to calculate hashes: %w", err)
+	}
+
+	fmt.Printf("Result saved to file %s\n", outputPath)
+	return nil
+}
+
+func printVersion() {
+	fmt.Printf("hashdir version %s\n", version)
+	fmt.Printf("Author: %s - %s\n", author, authorURL)
+}
+
+// parseArgs resolves the algorithm and target directory from CLI arguments,
+// defaulting to sha256 when only a directory is given.
+func parseArgs(args []string) (algorithm string, dir string, ok bool) {
+	switch len(args) {
+	case 1:
+		fmt.Printf("Algorithm not specified, using %s by default\n", defaultHash)
+		return defaultHash, args[0], true
+	case 2:
+		return args[0], args[1], true
+	default:
+		return "", "", false
+	}
 }
 
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Println("Usage: sha256/md5 <directory>")
+	args := os.Args[1:]
 
+	if len(args) == 1 && (args[0] == "-v" || args[0] == "--version") {
+		printVersion()
 		return
 	}
 
-	algorithm := os.Args[1]
-	dir := os.Args[2]
-	outputFilename := ""
-
-	if algorithm != "sha256" && algorithm != "md5" {
-		fmt.Println("Bad algorithm. Use sha256 or md5.")
-
+	algorithm, dir, ok := parseArgs(args)
+	if !ok {
+		fmt.Println(usageMessage)
 		return
 	}
 
-	if algorithm == "sha256" {
-		outputFilename = "sha256_hashes.txt"
+	if err := run(algorithm, dir); err != nil {
+		fmt.Println(err)
 	}
-
-	if algorithm == "md5" {
-		outputFilename = "md5_hashes.txt"
-	}
-
-	filePath := dir + "\\" + outputFilename
-
-	outputFile, err := os.Create(filePath)
-
-	if err != nil {
-		fmt.Println("Error while creating file with hashes:", err)
-
-		return
-	}
-
-	defer func(outputFile *os.File) {
-		err := outputFile.Close()
-		if err != nil {
-			fmt.Println("Error while closing file:", err)
-		}
-	}(outputFile)
-
-	fmt.Printf("Calculating hashes for directory ->  %s...\n", dir)
-
-	if err := walkFiles(algorithm, dir, outputFile); err != nil {
-		fmt.Println("Error while trying to calculate hashes:", err)
-
-		return
-	}
-
-	fmt.Printf("Result saved to file %s\n", filePath)
 }
