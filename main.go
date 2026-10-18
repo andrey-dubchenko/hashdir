@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,12 +12,14 @@ import (
 	"path/filepath"
 )
 
+// version is set at build time: -ldflags "-X main.version=...".
+var version = "dev"
+
 const (
-	version      = "1.0.0"
 	author       = "Andrey Dubchenko"
 	authorURL    = "https://github.com/andrey-dubchenko"
 	defaultHash  = "sha256"
-	usageMessage = "Usage: hashdir [sha256/md5] <directory>"
+	usageMessage = "Usage: hashdir [sha256/md5] <directory>\nSymbolic links to files are hashed by target content; links to directories and other non-regular files are skipped."
 )
 
 // hashers maps a supported algorithm name to its constructor.
@@ -25,12 +28,16 @@ var hashers = map[string]func() hash.Hash{
 	"sha256": sha256.New,
 }
 
+func reportName(algorithm string) string {
+	return algorithm + "_hashes.txt"
+}
+
 func calculateHash(newHash func() hash.Hash, filename string) (string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return "", err
 	}
-	defer closeQuietly(file)
+	defer file.Close()
 
 	h := newHash()
 	if _, err := io.Copy(h, file); err != nil {
@@ -40,41 +47,76 @@ func calculateHash(newHash func() hash.Hash, filename string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// isReport reports whether path is a hashes report produced by this tool
+// (any algorithm) located directly in root, or the file currently being written.
+func isReport(root, path string, info os.FileInfo, output os.FileInfo) bool {
+	if os.SameFile(info, output) {
+		return true
+	}
+	if filepath.Dir(path) != filepath.Clean(root) {
+		return false
+	}
+	for algorithm := range hashers {
+		if filepath.Base(path) == reportName(algorithm) {
+			return true
+		}
+	}
+	return false
+}
+
 // walkFiles hashes every regular file under root and writes "path: hash" lines
-// to outputFile. skipPath is excluded so the output file never hashes itself.
-func walkFiles(newHash func() hash.Hash, root string, skipPath string, outputFile *os.File) error {
-	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+// to out. Reports of this tool are excluded so they never hash themselves or
+// each other. Unreadable files are reported to stderr and counted, not fatal.
+func walkFiles(newHash func() hash.Hash, root string, output os.FileInfo, out io.Writer) (failed int, err error) {
+	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return err
+			fmt.Fprintln(os.Stderr, "Skipping:", err)
+			failed++
+			return nil
 		}
 
-		if !info.Mode().IsRegular() || path == skipPath {
+		if info.Mode()&os.ModeSymlink != 0 {
+			// Hash the content of the link target; links to directories are skipped.
+			info, err = os.Stat(path)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Skipping:", err)
+				failed++
+				return nil
+			}
+		}
+
+		if !info.Mode().IsRegular() || isReport(root, path, info, output) {
 			return nil
 		}
 
 		fileHash, err := calculateHash(newHash, path)
 		if err != nil {
-			return err
+			fmt.Fprintln(os.Stderr, "Skipping:", err)
+			failed++
+			return nil
 		}
 
-		_, err = fmt.Fprintf(outputFile, "%s: %s\n", path, fileHash)
+		_, err = fmt.Fprintf(out, "%s: %s\n", path, fileHash)
 		return err
 	})
+	return failed, err
 }
 
-func closeQuietly(f *os.File) {
-	if err := f.Close(); err != nil {
-		fmt.Println("Error while closing file:", err)
-	}
-}
-
-func run(algorithm, dir string) error {
+func run(algorithm, dir string) (err error) {
 	newHash, ok := hashers[algorithm]
 	if !ok {
 		return fmt.Errorf("bad algorithm %q, use sha256 or md5", algorithm)
 	}
 
-	outputPath, err := filepath.Abs(filepath.Join(dir, algorithm+"_hashes.txt"))
+	st, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("cannot access directory: %w", err)
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+
+	outputPath, err := filepath.Abs(filepath.Join(dir, reportName(algorithm)))
 	if err != nil {
 		return fmt.Errorf("error while resolving output path: %w", err)
 	}
@@ -83,12 +125,33 @@ func run(algorithm, dir string) error {
 	if err != nil {
 		return fmt.Errorf("error while creating file with hashes: %w", err)
 	}
-	defer closeQuietly(outputFile)
+	// On any failure remove the partial report; close errors are not lost.
+	defer func() {
+		if cerr := outputFile.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("error while closing file with hashes: %w", cerr)
+		}
+		if err != nil {
+			os.Remove(outputPath)
+		}
+	}()
+
+	outputInfo, err := outputFile.Stat()
+	if err != nil {
+		return fmt.Errorf("error while reading output file info: %w", err)
+	}
 
 	fmt.Printf("Calculating hashes for directory -> %s...\n", dir)
 
-	if err := walkFiles(newHash, dir, outputPath, outputFile); err != nil {
+	w := bufio.NewWriter(outputFile)
+	failed, err := walkFiles(newHash, dir, outputInfo, w)
+	if err != nil {
 		return fmt.Errorf("error while trying to calculate hashes: %w", err)
+	}
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("error while writing hashes: %w", err)
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d file(s) could not be hashed", failed)
 	}
 
 	fmt.Printf("Result saved to file %s\n", outputPath)
@@ -117,18 +180,25 @@ func parseArgs(args []string) (algorithm string, dir string, ok bool) {
 func main() {
 	args := os.Args[1:]
 
-	if len(args) == 1 && (args[0] == "-v" || args[0] == "--version") {
-		printVersion()
-		return
+	if len(args) == 1 {
+		switch args[0] {
+		case "-v", "--version":
+			printVersion()
+			return
+		case "-h", "--help":
+			fmt.Println(usageMessage)
+			return
+		}
 	}
 
 	algorithm, dir, ok := parseArgs(args)
 	if !ok {
-		fmt.Println(usageMessage)
-		return
+		fmt.Fprintln(os.Stderr, usageMessage)
+		os.Exit(2)
 	}
 
 	if err := run(algorithm, dir); err != nil {
-		fmt.Println(err)
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 }

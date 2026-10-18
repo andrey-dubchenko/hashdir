@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=hashdir
+GenericName=Directory hash calculator
+Comment=Calculates sha256 or md5 hashes of all files in a directory
+Exec=hashdir
+Icon=hashdir
+Terminal=true
+Categories=Utility;
+Keywords=hash;sha256;md5;checksum;

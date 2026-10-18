@@ -1,4 +1,20 @@
-/*.iml
+# Build output
+/dist/
+/*.exe
+/hashdir
+*.test
+*.out
+coverage.*
+
+# Reports produced by hashdir itself
+*_hashes.txt
+
+# Editors and tools
 /.idea/
-/build/
-*.exe
+/*.iml
+/.vscode/
+/.codegraph/
+/.claude/
+*.swp
+.DS_Store
+Thumbs.db
